@@ -1,0 +1,25 @@
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temp
+*.tmp
+*.bak
+
+# MQTT secrets (never commit)
+mqtt_secrets.json
+src/secrets.h
+
+# Internal handoff doc (contains broker credentials)
+HANDOFF.md
