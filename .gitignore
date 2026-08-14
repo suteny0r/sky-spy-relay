@@ -3,10 +3,12 @@
 .vscode/
 .idea/
 
-# Build artifacts
-*.bin
+# Build artifacts (build outputs live under .pio/, already ignored above)
 *.elf
 *.map
+
+# Release images in dist/ ARE tracked (flashable merged firmware)
+!dist/*.bin
 
 # OS files
 .DS_Store
