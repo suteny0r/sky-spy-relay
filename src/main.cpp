@@ -30,16 +30,22 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <DNSServer.h>
+#include <time.h>
+#include <esp_sntp.h>
 #include <PubSubClient.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include "dashboard.h"
+
+#define FW_VERSION "1.0.1"
 
 // ============================================================================
 // Hardware pins
@@ -248,6 +254,13 @@ static bool wifiConnected = false;
 static unsigned long lastMqttAttempt = 0;
 static unsigned long lastWifiAttempt = 0;
 
+// Internet time sync state (NTP + IP-based timezone).
+static bool timeSynced = false;      // clock has been configured for NTP
+static bool timeLogged = false;      // one-shot heartbeat print of the clock
+static bool netTimeOk = false;       // SNTP actually completed at least once
+static bool rtcSeeded = false;       // boot clock came from the expansion RTC
+static String timezoneName = "UTC";  // informational only; clock is always UTC
+
 // Runtime counters for the OLED
 static unsigned long detCount = 0;        // total detection lines received
 static unsigned long lastDetMs = 0;       // millis() of last detection
@@ -266,6 +279,31 @@ static bool looksLikeDetection(const char *line) {
     return strncmp(line, "{\"mac\"", 6) == 0;
 }
 
+// Add the relay's UTC receive timestamp to a forwarded JSON frame. Non-JSON
+// lines (plain console text) are returned verbatim so they stay intact. The
+// Sky Spy originator has no internet/time source of its own; the relay does
+// (internet-synced, battery-backed RTC), so it is the time authority that
+// stamps each detection for later logfile reconstruction.
+static String relayStamp(JsonDocument &doc, bool parsed, const char *l) {
+    if (!parsed) return String(l);
+    time_t nowt = time(nullptr);
+    if (nowt > 1600000000) {
+        doc["ts"] = (unsigned long)nowt;
+        struct tm utc;
+        gmtime_r(&nowt, &utc);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                 utc.tm_hour, utc.tm_min, utc.tm_sec);
+        doc["ts_str"] = buf;
+    } else {
+        doc["ts_ms"] = millis();  // clock not yet valid; uptime only
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
 static void handleLine(const char *line) {
     // Work on a local copy so the trailing-newline trim cannot touch the
     // caller's buffer (sim lines are const, UART lines are mutable).
@@ -280,12 +318,17 @@ static void handleLine(const char *line) {
     lineCount++;
     bool isDet = looksLikeDetection(l);
 
+    // Parse the Sky Spy frame once. The relay is the time authority: it has an
+    // internet-synced, battery-backed RTC while the originator does not, so we
+    // stamp every forwarded detection here. This only adds a key, so subscribers
+    // that read fields by name (sky-spy-aware-android) are unaffected.
+    JsonDocument doc;
+    bool parsed = (deserializeJson(doc, l) == DeserializationError::Ok);
+
     if (isDet) {
         detCount++;
         lastDetMs = millis();
-        JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, l);
-        if (!err) {
+        if (parsed) {
             const char *mac = doc["mac"] | "";
             int rssi = doc["rssi"] | 0;
             char brief[64];
@@ -295,10 +338,16 @@ static void handleLine(const char *line) {
     }
 
     if (mqtt && mqtt->connected()) {
+        String payload = relayStamp(doc, parsed, l);
         String rawTopic = cfgMqttTopic + "/raw";
         String detTopic = cfgMqttTopic + "/detections";
-        mqtt->publish(rawTopic.c_str(), l);
-        if (isDet) mqtt->publish(detTopic.c_str(), l);
+        mqtt->publish(rawTopic.c_str(), payload.c_str());
+        if (isDet) {
+            mqtt->publish(detTopic.c_str(), payload.c_str());
+            Serial.printf("[RELAY] sent detection %s\r\n", payload.c_str());
+        } else {
+            Serial.printf("[RELAY] sent line %s\r\n", payload.c_str());
+        }
     }
 }
 
@@ -318,6 +367,37 @@ static void pollRelayUart() {
 // ============================================================================
 // MQTT
 // ============================================================================
+// Publish a one-shot status message on every MQTT (re)connect so consumers
+// know the relay is live, who it is, and when it came online. The timestamp
+// falls back to uptime if the NTP sync has not landed yet.
+static void publishOnlineAnnounce() {
+    String statusTopic = cfgMqttTopic + "/status";
+    String announce;
+    JsonDocument doc;
+    doc["event"] = "publishing";
+    doc["device"] = "sky-spy-relay";
+    doc["mac"] = WiFi.macAddress();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["fw"] = FW_VERSION;
+    time_t nowt = time(nullptr);
+    if (timeSynced && nowt > 100000) {
+        doc["ts"] = (unsigned long)nowt;
+        struct tm utc;
+        gmtime_r(&nowt, &utc);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                 utc.tm_hour, utc.tm_min, utc.tm_sec);
+        doc["ts_str"] = buf;
+    } else {
+        doc["ts_ms"] = millis();  // clock not synced yet
+    }
+    serializeJson(doc, announce);
+    bool ok = mqtt->publish(statusTopic.c_str(), announce.c_str());
+    Serial.printf("[RELAY] online announce -> %s (%s)\r\n",
+                  statusTopic.c_str(), ok ? "ok" : "failed");
+}
+
 static void mqttReconnect() {
     if (mqtt == nullptr) return;
     if (mqtt->connected()) return;
@@ -334,6 +414,7 @@ static void mqttReconnect() {
     }
     if (ok) {
         Serial.println("[RELAY] MQTT connected");
+        publishOnlineAnnounce();
     } else {
         Serial.printf("[RELAY] MQTT connect failed rc=%d\r\n", mqtt->state());
     }
@@ -1078,6 +1159,131 @@ static void startWifiStation() {
 }
 
 // ============================================================================
+// Internet time sync: NTP only, clock always kept in UTC. Drone location events
+// are timestamped in UTC so consumers can translate to their own local time;
+// we deliberately do NOT apply any timezone offset (no geo-IP lookup).
+// ============================================================================
+
+static void syncTimeFromInternet() {
+    if (timeSynced) return;
+
+    // UTC only: configTime with a 0 offset keeps the libc clock on UTC
+    // (gmtime == localtime == UTC), and the RTC also stores UTC.
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    timeSynced = true;
+    Serial.println("[TIME] NTP sync started (UTC)");
+}
+
+// ============================================================================
+// Expansion board RTC (PCF8563 @ 0x51): the CR1220 coin cell keeps the clock
+// running while the board is powered off. On boot we seed the libc clock from
+// it if the time is still valid, so timestamps are correct before NTP lands;
+// after each NTP sync we refresh the RTC so the battery holds the new time.
+// ============================================================================
+#define RTC_I2C_ADDR 0x51
+static bool rtcPresent = false;
+
+static uint8_t rtcBcd(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
+
+static bool rtcReadTime(struct tm *out) {
+    Wire.beginTransmission(RTC_I2C_ADDR);
+    Wire.write(0x02);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)RTC_I2C_ADDR, (uint8_t)7) != 7) return false;
+    uint8_t b[7];
+    for (int i = 0; i < 7; i++) b[i] = Wire.read();
+
+    if (b[0] & 0x80) return false;  // VL set: clock integrity not guaranteed
+
+    // PCF8563 clones (e.g. BM8563) leave reserved high bits set in the
+    // weekday/century_month registers; mask them so the BCD decode is valid.
+    uint8_t sec = rtcBcd(b[0] & 0x7F);
+    uint8_t min = rtcBcd(b[1] & 0x7F);
+    uint8_t hour;
+    if (b[2] & 0x80) {  // 12h mode
+        uint8_t h = b[2] & 0x3F;
+        hour = ((h >> 4) & 0x01) * 10 + (h & 0x0F);
+        if (hour == 0) hour = 12;
+        if ((h & 0x20) && hour < 12) hour += 12;  // PM
+    } else {
+        hour = rtcBcd(b[2] & 0x3F);
+    }
+    uint8_t day = rtcBcd(b[3] & 0x3F);
+    uint8_t month = rtcBcd(b[5] & 0x1F);
+    uint8_t year = rtcBcd(b[6]);
+
+    if (sec > 59 || min > 59 || hour > 23 || day < 1 || day > 31 ||
+        month < 1 || month > 12) return false;
+
+    out->tm_sec = sec;
+    out->tm_min = min;
+    out->tm_hour = hour;
+    out->tm_mday = day;
+    out->tm_mon = month - 1;
+    out->tm_year = 2000 + year - 1900;
+    out->tm_wday = 0;
+    out->tm_isdst = 0;
+    return true;
+}
+
+// Write a UTC broken-down time, clearing the VL flag (24h mode). The RTC has
+// no timezone concept, so we always store UTC and let the TZ env handle local.
+static bool rtcWriteTime(const struct tm *t) {
+    uint8_t b[7];
+    b[0] = ((t->tm_sec / 10) << 4) | (t->tm_sec % 10);        // VL cleared
+    b[1] = ((t->tm_min / 10) << 4) | (t->tm_min % 10);
+    b[2] = ((t->tm_hour / 10) << 4) | (t->tm_hour % 10);      // 24h mode
+    b[3] = ((t->tm_mday / 10) << 4) | (t->tm_mday % 10);
+    b[4] = 0;
+    int mm = t->tm_mon + 1;
+    b[5] = ((mm / 10) << 4) | (mm % 10);
+    int yy = (t->tm_year + 1900) % 100;
+    b[6] = ((yy / 10) << 4) | (yy % 10);
+    Wire.beginTransmission(RTC_I2C_ADDR);
+    Wire.write(0x02);
+    Wire.write(b, 7);
+    return Wire.endTransmission() == 0;
+}
+
+static void initRtcTime() {
+    // Shares the OLED I2C bus; must run after dashboard_init() probes and
+    // before Serial1.begin() so the pins are free on headless builds.
+    Wire.begin(DISPLAY_SDA_PIN, DISPLAY_SCL_PIN);
+    Wire.beginTransmission(RTC_I2C_ADDR);
+    rtcPresent = (Wire.endTransmission() == 0);
+    if (!rtcPresent) {
+        Serial.println("[RTC] PCF8563 not detected");
+        if (!dashboard_present()) Wire.end();  // release pins when headless
+        return;
+    }
+    Serial.println("[RTC] PCF8563 detected (CR1220 backed)");
+
+    struct tm rtc;
+    if (!rtcReadTime(&rtc)) {
+        Serial.println("[RTC] time invalid (VL set or bad values) - waiting for NTP");
+        if (!dashboard_present()) Wire.end();
+        return;
+    }
+    int yr = rtc.tm_year + 1900;
+    if (yr < 2024 || yr > 2036) {
+        Serial.printf("[RTC] time implausible (year %d) - ignoring\r\n", yr);
+        if (!dashboard_present()) Wire.end();
+        return;
+    }
+    // TZ is still unset at this point, so mktime treats the broken-down
+    // fields as UTC. configTime() later only sets the TZ env var and starts
+    // SNTP; it does not reset the epoch, so this seed survives it.
+    time_t epoch = mktime(&rtc);
+    struct timeval tv = { epoch, 0 };
+    settimeofday(&tv, nullptr);
+    rtcSeeded = true;
+    Serial.printf("[TIME] RTC seed %04d-%02d-%02d %02d:%02d:%02d UTC\r\n",
+                  yr, rtc.tm_mon + 1, rtc.tm_mday,
+                  rtc.tm_hour, rtc.tm_min, rtc.tm_sec);
+    if (!dashboard_present()) Wire.end();
+}
+
+// ============================================================================
 // Run mode OLED pages
 // ============================================================================
 #define DASH_REFRESH_MS 1000
@@ -1105,6 +1311,29 @@ static const char *wifiStatusStr() {
     }
 }
 
+static void getClockStrings(char *dateBuf, size_t dlen, char *timeBuf, size_t tlen) {
+    time_t now = time(nullptr);
+    if (now < 1600000000) {
+        strncpy(dateBuf, "--/--/----", dlen - 1);
+        dateBuf[dlen - 1] = '\0';
+        strncpy(timeBuf, "--:--:--", tlen - 1);
+        timeBuf[tlen - 1] = '\0';
+        return;
+    }
+    struct tm t;
+    gmtime_r(&now, &t);
+    strftime(dateBuf, dlen, "%Y-%m-%d", &t);
+    strftime(timeBuf, tlen, "%H:%M:%S", &t);
+}
+
+// Short status of the internet time sync for the dashboard (always UTC).
+static const char *netTimeStatus() {
+    if (netTimeOk) return "NTP OK";
+    if (timeSynced) return "NTP SYNC";
+    if (rtcSeeded) return "RTC ONLY";
+    return "NTP OFF";
+}
+
 static void renderRunDashboard() {
     if (!dashboard_present()) return;
     unsigned long now = millis();
@@ -1118,21 +1347,31 @@ static void renderRunDashboard() {
 
     switch (dashPage) {
         case DASH_PAGE_STATUS:
-            dashRow(2);
-            dashboard_printf("WIFI %s", wifiStatusStr());
-            dashRow(3);
-            if (WiFi.status() == WL_CONNECTED) {
-                dashboard_printf("IP %s", WiFi.localIP().toString().c_str());
-            } else {
-                dashboard_printf("RSSI -");
-            }
-            dashRow(5);
-            dashboard_printf("MQTT %s", (mqtt && mqtt->connected()) ? "CONNECTED" : "DOWN");
-            dashRow(6);
             {
-                String host = cfgMqttHost;
-                if (host.length() > 18) host = host.substring(0, 18);
-                dashboard_printf("%s:%d", host.c_str(), cfgMqttPort);
+                char dbuf[16], tbuf[16];
+                getClockStrings(dbuf, sizeof(dbuf), tbuf, sizeof(tbuf));
+                dashRow(1);
+                dashboard_printf("%s", dbuf);
+                dashRow(2);
+                dashboard_printf("%s %s", tbuf, timezoneName.c_str());
+                dashRow(3);
+                dashboard_printf("WIFI %s", wifiStatusStr());
+                dashRow(4);
+                if (WiFi.status() == WL_CONNECTED) {
+                    dashboard_printf("IP %s", WiFi.localIP().toString().c_str());
+                } else {
+                    dashboard_printf("RSSI -");
+                }
+                dashRow(5);
+                dashboard_printf("MQTT %s", (mqtt && mqtt->connected()) ? "CONNECTED" : "DOWN");
+                dashRow(6);
+                dashboard_printf("TIME %s", netTimeStatus());
+                dashRow(7);
+                {
+                    String host = cfgMqttHost;
+                    if (host.length() > 18) host = host.substring(0, 18);
+                    dashboard_printf("%s:%d", host.c_str(), cfgMqttPort);
+                }
             }
             break;
 
@@ -1245,13 +1484,14 @@ void setup() {
     delay(200);
 
     Serial.println("\n========================================");
-    Serial.println("SKY-SPY-RELAY v1.0");
+    Serial.printf("SKY-SPY-RELAY v%s\r\n", FW_VERSION);
     Serial.println("========================================");
 
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);  // LED off (inverted logic)
 
     dashboard_init();
+    initRtcTime();
     buzzerPin = dashboard_buzzer_pin();
     pinMode(buzzerPin, OUTPUT);
     digitalWrite(buzzerPin, LOW);
@@ -1315,6 +1555,34 @@ void loop() {
                       lineCount, detCount);
     }
 
+    // Log the clock once the NTP sync actually lands (SNTP is async), then
+    // refresh the RTC so the coin cell holds the corrected time. If the RTC
+    // seeded the clock at boot, time() is already valid; only SNTP_COMPLETED
+    // means we truly synchronized with an internet source.
+    if (timeSynced && !timeLogged) {
+        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            time_t nowt = time(nullptr);
+            if (nowt > 100000) {
+                timeLogged = true;
+                netTimeOk = true;
+                struct tm utc;
+                gmtime_r(&nowt, &utc);
+                Serial.printf("[TIME] sync OK %04d-%02d-%02d %02d:%02d:%02d UTC\r\n",
+                              utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                              utc.tm_hour, utc.tm_min, utc.tm_sec);
+                if (rtcPresent) {
+                    struct tm utc;
+                    gmtime_r(&nowt, &utc);
+                    if (rtcWriteTime(&utc)) {
+                        Serial.println("[TIME] RTC updated (UTC)");
+                    } else {
+                        Serial.println("[TIME] RTC write failed");
+                    }
+                }
+            }
+        }
+    }
+
     checkRunButton();
     // (page advance is handled inside checkRunButton's tap logic)
 
@@ -1335,10 +1603,14 @@ void loop() {
                 wifiConnected = true;
                 Serial.printf("[RELAY] WiFi connected, IP %s\r\n",
                               WiFi.localIP().toString().c_str());
+                syncTimeFromInternet();
             }
         } else {
             if (wifiConnected) {
                 wifiConnected = false;
+                timeSynced = false;
+                timeLogged = false;
+                netTimeOk = false;
                 Serial.println("[RELAY] WiFi lost");
             }
             if (millis() - lastWifiAttempt > 10000) {

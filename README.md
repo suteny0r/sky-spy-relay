@@ -19,7 +19,7 @@ Sky Spy (Mode 5)  ---------------->  sky-spy-relay (this project)
 ```
 
 - **Sky Spy side (Mode 5, oui-spy-unified-blue):** when the expansion board OLED is detected, Serial1 moves to the Grove UART pins (GPIO43 TX / GPIO44 RX) and emits one full JSON line per detection. Headless builds keep the legacy Heltec LoRa/Meshtastic compact messages on GPIO5/6.
-- **Relay side (this project):** `Serial1` on GPIO44 RX reads those lines. Each line is published to `skyspy/<topic>/raw`; lines that are detection JSON (start with `{"mac"`) are also published to `skyspy/<topic>/detections`.
+- **Relay side (this project):** `Serial1` on GPIO44 RX reads those lines. Each line is published to `skyspy/<topic>/raw`; lines that are detection JSON (start with `{"mac"`) are also published to `skyspy/<topic>/detections`. The relay is the **time authority**: it has an internet connection plus a battery-backed RTC (PCF8563 on the expansion board), so it stamps every detection with a UTC receive timestamp before publishing. Sky Spy itself has no time source and never timestamps.
 
 ## Wiring
 
@@ -97,16 +97,11 @@ With no saved config the relay boots its AP and serves the same config page at *
 - **Hold the USER button (GPIO2) for 2 seconds** at any time. This clears the saved WiFi credentials and reboots into the wizard.
 - The portal also exposes `/reset` to wipe all saved config.
 
-## MQTT Topics
+## Time synchronization & timestamps
 
-With topic prefix `skyspy` (the default):
+The relay keeps its clock via **NTP** (`pool.ntp.org` / `time.nist.gov`) on every WiFi connect, and a **battery-backed PCF8563 RTC** on the expansion board holds the time across power loss, so timestamps are already valid at boot (seeded from the RTC before NTP lands). All timestamps are **UTC** — drone events are recorded in UTC and translated to local time by consumers.
 
-| Topic | Payload |
-|-------|---------|
-| `skyspy/<prefix>/raw` | every non-blank line received on the Grove UART |
-| `skyspy/<prefix>/detections` | detection JSON lines only |
-
-Detection JSON line (identical to the Sky Spy USB serial output):
+Every forwarded detection is stamped by the relay at the moment it is published:
 
 ```json
 {
@@ -117,7 +112,46 @@ Detection JSON line (identical to the Sky Spy USB serial output):
   "drone_altitude": 118,
   "pilot_lat": 25.767196,
   "pilot_long": -80.137115,
-  "basic_id": "1581F8LQC255L00227P5"
+  "basic_id": "1581F8LQC255L00227P5",
+  "ts": 1755148800,
+  "ts_str": "2025-08-14T04:00:00Z"
+}
+```
+
+- `ts` — Unix epoch seconds (UTC).
+- `ts_str` — the same instant as an ISO-8601 UTC string with a `Z` suffix.
+
+These fields are **additive** (new keys on the existing Sky Spy record), so subscribers that read fields by name — including **sky-spy-aware-android** — are unaffected. If the relay clock is not yet valid when a line arrives, the message instead carries `ts_ms` (relay uptime in milliseconds) so consumers know the time is relative only.
+
+The relay also logs every sent message to its USB serial console, e.g.:
+
+```
+[RELAY] sent detection {"mac":"...","ts":1755148800,"ts_str":"2025-08-14T04:00:00Z", ...}
+```
+
+## MQTT Topics
+
+With topic prefix `skyspy` (the default):
+
+| Topic | Payload |
+|-------|---------|
+| `skyspy/<prefix>/raw` | every non-blank line received on the Grove UART |
+| `skyspy/<prefix>/detections` | detection JSON lines only |
+
+Detection JSON line. The relay adds a UTC `ts` / `ts_str` timestamp to every detection (see [Time synchronization & timestamps](#time-synchronization--timestamps)):
+
+```json
+{
+  "mac": "8c:1e:d9:c8:c9:f7",
+  "rssi": -81,
+  "drone_lat": 25.784279,
+  "drone_long": -80.149010,
+  "drone_altitude": 118,
+  "pilot_lat": 25.767196,
+  "pilot_long": -80.137115,
+  "basic_id": "1581F8LQC255L00227P5",
+  "ts": 1755148800,
+  "ts_str": "2025-08-14T04:00:00Z"
 }
 ```
 
@@ -132,6 +166,7 @@ python server.py --mqtt-subscribe
 ## Expansion Board OLED + Button
 
 - **USER button** is the only input: TAP advances the OLED status pages (Status, Last Detection, Counters, Help, SIM Test), HOLD 2s re-enters the setup wizard. On the SIM Test page, HOLD 1s publishes the 23 captured detection lines to MQTT once, while the relay keeps running.
+- The **Status** page shows the current **date and time (UTC)** plus a time-sync indicator (`NTP OK` / `NTP SYNC` / `RTC ONLY` / `NTP OFF`) so you can confirm the relay's clock is valid before trusting detection timestamps.
 - All `dashboard_*()` calls are safe no-ops when no expansion board is attached, so the relay also works bare.
 
 ## Pins
