@@ -45,7 +45,7 @@
 #include <ArduinoJson.h>
 #include "dashboard.h"
 
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.1.0"
 
 // ============================================================================
 // Hardware pins
